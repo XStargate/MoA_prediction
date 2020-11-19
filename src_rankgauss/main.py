@@ -21,7 +21,7 @@ def main():
     data_dir = '../../data'
     save_path = './'
     load_path = './'
-    runty = 'train'
+    runty = 'traineval'
 
     train_features = pd.read_csv(os.path.join(data_dir, 'train_features.csv'))
     train_targets_scored = pd.read_csv(os.path.join(data_dir, 'train_targets_scored.csv'))
@@ -58,6 +58,10 @@ def main():
         elif (runty == 'eval'):
             predictions_ = trte.run_k_fold(seed)
             predictions += predictions_ / len(cfg.seed)
+        elif (runty == 'traineval'):
+            oof_, predictions_ = trte.run_k_fold(seed)
+            oof += oof_ / len(cfg.seed)
+            predictions += predictions_ / len(cfg.seed)
 
         # oof_, predictions_ = trte.run_k_fold(seed)
         # oof += oof_ / len(cfg.seed)
@@ -74,7 +78,7 @@ def main():
         score = 0
         for i in range(len(target_cols)):
             score_ = log_loss(y_true[:, i], y_pred[:, i])
-            score += score_ / target.shape[1]
+            score += score_ / (target.shape[1]-1)
 
         print("CV log_loss: ", score)
 
@@ -82,7 +86,33 @@ def main():
         test[target_cols] = predictions
 
         sub = submission.drop(columns=target_cols).merge(
-        test[['sig_id']+target_cols], on='sig_id', how='left').fillna(0)
+            test[['sig_id']+target_cols], on='sig_id', how='left').fillna(0)
+
+        # clip the submission
+        # sub_c = sub_clip(sub, test_features)
+        # sub_c.to_csv('submission.csv', index=False)
+
+        sub.to_csv('submission.csv', index=False)
+        
+    elif (runty == 'traineval'):
+        train[target_cols] = oof
+        valid_results = train_targets_scored.drop(columns=target_cols).merge(
+            train[['sig_id']+target_cols], on='sig_id', how='left').fillna(0)
+
+        y_true = train_targets_scored[target_cols].values
+        y_pred = valid_results[target_cols].values
+
+        score = 0
+        for i in range(len(target_cols)):
+            score_ = log_loss(y_true[:, i], y_pred[:, i])
+            score += score_ / (target.shape[1]-1)
+
+        print("CV log_loss: ", score)
+        
+        test[target_cols] = predictions
+
+        sub = submission.drop(columns=target_cols).merge(
+            test[['sig_id']+target_cols], on='sig_id', how='left').fillna(0)
 
         # clip the submission
         # sub_c = sub_clip(sub, test_features)

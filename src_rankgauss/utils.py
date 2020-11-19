@@ -31,7 +31,7 @@ def sub_clip(sub, test_features, minval=0.001, maxval=0.995):
     tmp = sub.drop(['sig_id'], axis=1)
     tmp_c = tmp.clip(minval, maxval)
     sub_ = pd.concat([sub['sig_id'], tmp_c], axis=1)
-    sub_.loc[test_features['cp_type']=='ctl_vehicle', sub_.columns[1:]] = 0
+    # sub_.loc[test_features['cp_type']=='ctl_vehicle', sub_.columns[1:]] = 0
 
     return sub_
 

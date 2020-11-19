@@ -45,7 +45,8 @@ def valid_fn(model, loss_fn, dataloader, device):
 
         final_loss += loss.item()
         valid_preds.append(outputs.sigmoid().detach().cpu().numpy())
-
+        # valid_preds.append(outputs.detach().cpu().numpy())
+        
     final_loss /= len(dataloader)
     valid_preds = np.concatenate(valid_preds)
 
@@ -62,6 +63,7 @@ def inference_fn(model, dataloader, device):
             outputs = model(inputs)
 
         preds.append(outputs.sigmoid().detach().cpu().numpy())
+        # preds.append(outputs.detach().cpu().numpy())
 
     preds = np.concatenate(preds)
 
@@ -75,7 +77,7 @@ class train_test():
         self.save_path = save_path
         self.load_path = load_path
 
-        assert runty == 'train' or runty == 'eval',  \
+        assert runty == 'train' or runty == 'eval' or runty == 'traineval',  \
             "Run type is wrong. Should be 'train' or 'eval'. "
 
         self.runty = runty
@@ -206,11 +208,19 @@ class train_test():
             elif (self.runty == 'eval'):
                 pred_ = self.run_evaluate(fold, seed)
                 predictions += pred_ / self.cfg.nfolds
+            elif (self.runty == 'traineval'):
+                oof_ = self.run_training(fold, seed)
+                pred_ = self.run_evaluate(fold, seed)
+                oof += oof_
+                predictions += pred_ / self.cfg.nfolds
+                
 
         if (self.runty == 'train'):
             return oof
         elif (self.runty == 'eval'):
             return predictions
+        elif(self.runty == 'traineval'):
+            return oof, predictions
 
 
 # def run_training(fold, seed):
