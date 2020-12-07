@@ -1,440 +1,127 @@
-from iterstrat.ml_stratifiers import MultilabelStratifiedKFold, MultilabelStratifiedShuffleSplit
-import numpy as np
+# import modules
+from config import Config_FeatureEngineer, Config_TabNet
+from cluster_kmeans import fe_cluster
+from fe_stats import fe_stats
+from train_TabNet import train_tabnet, pred_tabnet
+from utils import seed_everything, onehot_encoding, remove_ctl, make_cv_folds
+from labelsmoothing import ls_manual
+from feature_selection import feature_selection
+from scaling import scaling
+from decompo import decompo_process
+
+# import basics
 import pandas as pd
-from sklearn.metrics import roc_auc_score
-import torch
-
+import numpy as np
 import os
+from time import time
+import datetime
+import warnings
+warnings.filterwarnings("ignore")
 
-from config import Config
-from dataloader import get_ratio_labels, transform_data
-from model import TabNetRegressor
-from loss import (log_loss_score, log_loss_multi, auc_multi, LabelSmoothingLoss, SmoothBCEwLogits)
-from utils import seed_everything, check_targets
 
-from pdb import set_trace
+def main():
 
-def main(runtype):
-    assert runtype == 'train' or runtype == 'eval'
+    cfg_fe = Config_FeatureEngineer()
+    seed_everything(seed_value=cfg_fe.seed)
 
-    seed_everything(42)
+    data_dir = '/kaggle/input/lish-moa/'
+    save_path = './'
+    load_path = '/kaggle/input/moatabnetmultimodekfold/'
+    runty = 'eval'
 
-    data_dir = '../../data'
     train = pd.read_csv(os.path.join(data_dir, 'train_features.csv'))
-    train_targets_scored = pd.read_csv(os.path.join(data_dir, 'train_targets_scored.csv'))
-    train_targets_nonscored = pd.read_csv(os.path.join(data_dir, 'train_targets_nonscored.csv'))
-    test_features = pd.read_csv(os.path.join(data_dir, 'test_features.csv'))
+    targets_scored = pd.read_csv(os.path.join(data_dir, 'train_targets_scored.csv'))
+    test = pd.read_csv(os.path.join(data_dir, 'test_features.csv'))
+    train_drug = pd.read_csv(os.path.join(data_dir, 'train_drug.csv'))
     submission = pd.read_csv(os.path.join(data_dir, 'sample_submission.csv'))
 
-    remove_vehicle = True
+    x_train = train.copy()
+    x_test = test.copy()
+    y_train = targets_scored.copy()
 
-    if remove_vehicle:
-        train_features = train.loc[train['cp_type']=='trt_cp'].reset_index(drop=True)
-        train_targets_scored = train_targets_scored.loc[train['cp_type']=='trt_cp'].reset_index(drop=True)
-        train_targets_nonscored = train_targets_nonscored.loc[train['cp_type']=='trt_cp'].reset_index(drop=True)
-    else:
-        train_features = train
+    genes_features = [column for column in x_train.columns if 'g-' in column]
+    cells_features = [column for column in x_train.columns if 'c-' in column]
 
-    col_features = list(train_features.columns)[1:]
-    cat_tr, cat_test, numerical_tr, numerical_test = \
-        transform_data(train_features, test_features, col_features,
-                       normalize=False, removed_vehicle=remove_vehicle)
+    # scale the data, like RankGauss
+    x_train, x_test = scaling(x_train, x_test, scale=cfg_fe.scale,
+                              n_quantiles=cfg_fe.scale_n_quantiles, seed=cfg_fe.seed)
 
-    columns, ratios = get_ratio_labels(train_targets_scored)
-    columns_nonscored, ratios_nonscored = get_ratio_labels(train_targets_nonscored)
-    targets_tr = train_targets_scored[columns].values.astype(np.float32)
-    targets2_tr = train_targets_nonscored[columns_nonscored].values.astype(np.float32)
+    # decompose data, like PCA
+    if runty == 'traineval':
+        x_train, x_test = decompo_process(x_train, x_test, decompo=cfg_fe.decompo, genes_variance=cfg_fe.genes_variance,
+                                          cells_variance=cfg_fe.cells_variance, seed=cfg_fe.seed, pca_drop_orig=cfg_fe.pca_drop_orig, runty=runty, path=save_path)
+    elif runty == 'eval':
+        x_train, x_test = decompo_process(x_train, x_test, decompo=cfg_fe.decompo, genes_variance=cfg_fe.genes_variance,
+                                          cells_variance=cfg_fe.cells_variance, seed=cfg_fe.seed, pca_drop_orig=cfg_fe.pca_drop_orig, runty=runty, path=load_path)
 
-    cfg = Config(num_class = targets_tr.shape[1], cat_tr = cat_tr, numerical_tr_num=numerical_tr.shape[1])
+    # select feature, VarianceThreshold
+    x_train, x_test = feature_selection(
+        x_train, x_test, feature_select=cfg_fe.feature_select, variancethreshold_for_FS=cfg_fe.variancethreshold_for_FS)
 
-    X_test = np.concatenate([cat_test, numerical_test], axis=1)
+    # fe_stats
+    x_train, x_test = fe_stats(x_train, x_test, genes_features, cells_features)
 
-    if cfg.strategy == "KFOLD":
-        oof_preds_all = []
-        oof_targets_all = []
-        scores_all =  []
-        scores_auc_all= []
-        preds_test = []
-        for seed in range(cfg.num_ensembling):
-            print("## SEED : ", seed)
-            mskf = MultilabelStratifiedKFold(n_splits=cfg.SPLITS, random_state=cfg.seed+seed, shuffle=True)
-            oof_preds = []
-            oof_targets = []
-            scores = []
-            scores_auc = []
-            p = []
-            for j, (train_idx, val_idx) in enumerate(mskf.split(np.zeros(len(cat_tr)), targets_tr)):
-                print("FOLDS : ", j)
+    # group the drug using kmeans
+    if runty == 'traineval':
+        x_train, x_test = fe_cluster(x_train, x_test, genes_features, cells_features,
+                                     n_cluster_g=cfg_fe.n_clusters_g, n_cluster_c=cfg_fe.n_clusters_c, seed=cfg_fe.seed, runty=runty, path=save_path)
+    elif runty == 'eval':
+        x_train, x_test = fe_cluster(x_train, x_test, genes_features, cells_features,
+                                     n_cluster_g=cfg_fe.n_clusters_g, n_cluster_c=cfg_fe.n_clusters_c, seed=cfg_fe.seed, runty=runty, path=load_path)
 
-                ## model
-                X_train, y_train = torch.as_tensor(np.concatenate([cat_tr[train_idx], numerical_tr[train_idx] ], axis=1)), torch.as_tensor(targets_tr[train_idx])
-                X_val, y_val = torch.as_tensor(np.concatenate([cat_tr[val_idx], numerical_tr[val_idx] ], axis=1)), torch.as_tensor(targets_tr[val_idx])
-                model = TabNetRegressor(n_d=32, n_a=32, n_steps=1, gamma=1.3, lambda_sparse=0, cat_dims=cfg.cat_dims, cat_emb_dim=cfg.cat_emb_dim, cat_idxs=cfg.cats_idx, optimizer_fn=torch.optim.Adam,
-                                        optimizer_params=dict(lr=2e-2, weight_decay=1e-5), mask_type='entmax', device_name=cfg.device, scheduler_params=dict(milestones=[ 100,150], gamma=0.9), scheduler_fn=torch.optim.lr_scheduler.MultiStepLR)
-                #'sparsemax'
+    # one-hot encoding
+    x_train = onehot_encoding(x_train)
+    x_test = onehot_encoding(x_test)
 
-                if (runtype == 'train'):
-                    model.fit(X_train=X_train, y_train=y_train, X_valid=X_val, y_valid=y_val,max_epochs=cfg.EPOCHS, patience=50, batch_size=512, virtual_batch_size=32,
-                          num_workers=0, drop_last=False, loss_fn=LabelSmoothingLoss(classes=y_val.shape[1], smoothing=0.01))
-                    # torch.nn.functional.binary_cross_entropy_with_logits)
-                    model.load_best_model()
+    feature_cols = [c for c in x_train.columns if (str(c)[0:5] != 'kfold' and c not in [
+                                                   'sig_id', 'drug_id', 'cp_type', 'cp_time', 'cp_dose'])]
+    target_cols = [x for x in y_train.columns if x != 'sig_id']
 
-                name = cfg.save_name + f"_fold{j}_{seed}"
-                if (runtype == 'train'):
-                    model.save_model(name)
-                if (runtype == 'eval'):
-                    model.load_model_infer(name)
+    # label smoothing
+    if cfg_fe.regularization_ls:
+        y_train = ls_manual(y_train, ls_rate=cfg_fe.ls_rate)
 
-                # preds on val
-                preds = model.predict(X_val)
-                preds = torch.sigmoid(torch.as_tensor(preds)).detach().cpu().numpy()
-                score = log_loss_multi(y_val, preds)
+    # merge drug_id and labels
+    x_train = x_train.merge(y_train, on='sig_id')
+    x_train = x_train.merge(train_drug, on='sig_id')
 
-                # preds on test
-                if (runtype == 'eval'):
-                    temp = model.predict(X_test)
-                    p.append(torch.sigmoid(torch.as_tensor(temp)).detach().cpu().numpy())
-                ## save oof to compute the CV later
-                oof_preds.append(preds)
-                oof_targets.append(y_val)
-                scores.append(score)
-                scores_auc.append(auc_multi(y_val,preds))
-                print(f"validation fold {j} : {score}")
-            if (runtype == 'eval'):
-                p = np.stack(p)
-                preds_test.append(p)
-            oof_preds_all.append(np.concatenate(oof_preds))
-            oof_targets_all.append(np.concatenate(oof_targets))
-            scores_all.append(np.array(scores))
-            scores_auc_all.append(np.array(scores_auc))
-        if (runtype == 'eval'):
-            preds_test = np.stack(preds_test)
+    # remove sig_id
+    # x_train, x_test, y_train = remove_ctl(x_train, x_test, y_train)
 
-        for i in range(cfg.num_ensembling):
-            print("CV score fold : ", log_loss_multi(oof_targets_all[i], oof_preds_all[i]))
-            print("auc mean : ", sum(scores_auc_all[i]) / len(scores_auc_all[i]))
+    # make CVs
+    target_cols = [x for x in targets_scored.columns if x != 'sig_id']
+    x_train = make_cv_folds(x_train, cfg_fe.seeds, cfg_fe.nfolds, cfg_fe.drug_thresh, target_cols)
 
-    else:
-        i = 0
-        mskf = MultilabelStratifiedShuffleSplit(n_splits=1000, test_size=0.1, random_state=0)
-        oof_preds = []
-        oof_targets = []
-        scores = []
-        scores_auc = []
-        for j, (train_idx, val_idx) in enumerate(mskf.split(np.zeros(len(cat_tr)), targets_tr)):
-            if i == cfg.SPLITS:
-                break
-            if not check_targets(targets_tr[train_idx]):
-                continue
-            print("FOLDS : ", i, j)
+    begin_time = datetime.datetime.now()
 
-            ## model
-            X_train, y_train = torch.as_tensor(np.concatenate([cat_tr[train_idx], numerical_tr[train_idx] ], axis=1)), torch.as_tensor(targets_tr[train_idx])
-            X_val, y_val = torch.as_tensor(np.concatenate([cat_tr[val_idx], numerical_tr[val_idx] ], axis=1)), torch.as_tensor(targets_tr[val_idx])
-            model = TabNetRegressor(n_d=8, n_a=8, n_steps=3, gamma=1.3, cat_dims=cat_dims, cat_emb_dim=cfg.cat_emb_dim, cat_idxs=cats_idx, optimizer_fn=torch.optim.Adam,
-                               optimizer_params=dict(lr=1e-3, amsgrad=True), mask_type="sparsemax", device_name=cfg.device)
+    if (runty == 'traineval'):
+        test_preds_all = train_tabnet(x_train, y_train, x_test, submission,
+                                      feature_cols, target_cols, cfg_fe.seeds, cfg_fe.nfolds, save_path)
+        y_train = targets_scored[train['cp_type'] != 'ctl_vehicle'].reset_index(drop=True)
+        test_pred_final = pred_tabnet(x_train, y_train, x_test, submission, feature_cols,
+                                      target_cols, cfg_fe.seeds, cfg_fe.nfolds, load_path='./', stacking=False)
+    elif (runty == 'eval'):
+        y_train = targets_scored[train['cp_type'] != 'ctl_vehicle'].reset_index(drop=True)
+        test_pred_final = pred_tabnet(x_train, y_train, x_test, submission, feature_cols,
+                                      target_cols, cfg_fe.seeds, cfg_fe.nfolds, load_path, stacking=False)
 
-            if (runtype == 'train'):
-                model.fit(X_train=X_train, y_train=y_train, X_valid=X_val, y_valid=y_val,max_epochs=cfg.EPOCHS, patience=50, batch_size=512, virtual_batch_size=32,
-                    num_workers=0, drop_last=False, loss_fn=torch.nn.functional.binary_cross_entropy_with_logits)
-                model.load_best_model()
+    time_diff = datetime.datetime.now() - begin_time
+    print(f'Total time is {time_diff}')
 
-            name = cfg.save_name + f"_{j}"
-            if (runtype == 'train'):
-                model.save_model(name)
-            if (runtype == 'eval'):
-                model.load_model_infer(name)
+    # make submission
+    all_feat = [col for col in submission.columns if col not in ["sig_id"]]
+    # To obtain the same lenght of test_preds_all and submission
+    # sig_id = test[test["cp_type"] != "ctl_vehicle"].sig_id.reset_index(drop=True)
+    sig_id = test.sig_id
+    tmp = pd.DataFrame(test_pred_final, columns=all_feat)
+    tmp["sig_id"] = sig_id
 
-            # preds on val
-            preds = model.predict(X_val)
-            preds = torch.sigmoid(torch.as_tensor(preds)).detach().cpu().numpy()
-            score = log_loss_multi(y_val, preds)
+    submission = pd.merge(test[["sig_id"]], tmp, on="sig_id", how="left")
+    submission.fillna(0, inplace=True)
+    submission[test["cp_type"] == "ctl_vehicle"] = 0.
 
-            # preds on test
-            if (runtype == 'eval'):
-                temp = model.predict(X_test)
-                p.append(torch.sigmoid(torch.as_tensor(temp)).detach().cpu().numpy())
+    submission.to_csv("submission_tabbet.csv", index=None)
 
-            ## save oof to compute the CV later
-            oof_preds.append(preds)
-            oof_targets.append(y_val)
-            scores.append(score)
-            scores_auc.append(auc_multi(y_val,preds))
-            print(f"validation fold {j} : {score}")
-            i+=1
-            if (runtype == 'eval'):
-                p = np.stack(p)
-                preds_test.append(p)
-            #break
-
-        if (runtype == 'eval'):
-            preds_test = np.stack(preds_test)
-        print("auc mean : ", sum(scores_auc)/len(scores_auc))
-        print("CV score : ", log_loss_multi(np.concatenate(oof_targets) , np.concatenate(oof_preds)))
-
-    if (runtype == 'eval'):
-        # clip the submission
-        sub = np.clip(preds_test.mean(1).mean(0), 0.001, 0.995)
-        submission[columns] = sub
-        submission.loc[test_features['cp_type']=='ctl_vehicle', submission.columns[1:]] = 0
-        submission.to_csv("submission.csv", index=False)
-
-def train():
-    seed_everything(42)
-
-    data_dir = '../../data'
-    train = pd.read_csv(os.path.join(data_dir, 'train_features.csv'))
-    train_targets_scored = pd.read_csv(os.path.join(data_dir, 'train_targets_scored.csv'))
-    train_targets_nonscored = pd.read_csv(os.path.join(data_dir, 'train_targets_nonscored.csv'))
-    test_features = pd.read_csv(os.path.join(data_dir, 'test_features.csv'))
-    submission = pd.read_csv(os.path.join(data_dir, 'sample_submission.csv'))
-
-    remove_vehicle = True
-
-    if remove_vehicle:
-        train_features = train.loc[train['cp_type']=='trt_cp'].reset_index(drop=True)
-        train_targets_scored = train_targets_scored.loc[train['cp_type']=='trt_cp'].reset_index(drop=True)
-        train_targets_nonscored = train_targets_nonscored.loc[train['cp_type']=='trt_cp'].reset_index(drop=True)
-    else:
-        train_features = train
-
-    col_features = list(train_features.columns)[1:]
-    cat_tr, cat_test, numerical_tr, numerical_test = \
-        transform_data(train_features, test_features, col_features,
-                       normalize=False, removed_vehicle=remove_vehicle)
-
-    columns, ratios = get_ratio_labels(train_targets_scored)
-    columns_nonscored, ratios_nonscored = get_ratio_labels(train_targets_nonscored)
-    targets_tr = train_targets_scored[columns].values.astype(np.float32)
-    targets2_tr = train_targets_nonscored[columns_nonscored].values.astype(np.float32)
-
-    cfg = Config(num_class = targets_tr.shape[1], cat_tr = cat_tr, numerical_tr_num=numerical_tr.shape[1])
-
-    X_test = np.concatenate([cat_test, numerical_test], axis=1)
-
-    if cfg.strategy == "KFOLD":
-        oof_preds_all = []
-        oof_targets_all = []
-        scores_all =  []
-        scores_auc_all= []
-        for seed in range(cfg.num_ensembling):
-            print("## SEED : ", seed)
-            mskf = MultilabelStratifiedKFold(n_splits=cfg.SPLITS, random_state=cfg.seed+seed, shuffle=True)
-            oof_preds = []
-            oof_targets = []
-            scores = []
-            scores_auc = []
-            for j, (train_idx, val_idx) in enumerate(mskf.split(np.zeros(len(cat_tr)), targets_tr)):
-                print("FOLDS : ", j)
-
-                ## model
-                X_train, y_train = torch.as_tensor(np.concatenate([cat_tr[train_idx], numerical_tr[train_idx] ], axis=1)), torch.as_tensor(targets_tr[train_idx])
-                X_val, y_val = torch.as_tensor(np.concatenate([cat_tr[val_idx], numerical_tr[val_idx] ], axis=1)), torch.as_tensor(targets_tr[val_idx])
-                model = TabNetRegressor(n_d=32, n_a=32, n_steps=1, gamma=1.3, lambda_sparse=0, cat_dims=cfg.cat_dims, cat_emb_dim=cfg.cat_emb_dim, cat_idxs=cfg.cats_idx, optimizer_fn=torch.optim.Adam,
-                                        optimizer_params=dict(lr=2e-2, weight_decay=1e-5), mask_type='entmax', device_name=cfg.device, scheduler_params=dict(milestones=[ 100,150], gamma=0.9), scheduler_fn=torch.optim.lr_scheduler.MultiStepLR)
-                #'sparsemax'
-
-                model.fit(X_train=X_train, y_train=y_train, X_valid=X_val, y_valid=y_val,max_epochs=cfg.EPOCHS, patience=50, batch_size=1024, virtual_batch_size=32,
-                          num_workers=0, drop_last=False, loss_fn=SmoothBCEwLogits(smoothing=0.001))
-                # torch.nn.functional.binary_cross_entropy_with_logits)
-                model.load_best_model()
-                preds = model.predict(X_val)
-                preds = torch.sigmoid(torch.as_tensor(preds)).detach().cpu().numpy()
-                score = log_loss_multi(y_val, preds)
-                name = cfg.save_name + f"_fold{j}_{seed}"
-                model.save_model(name)
-                ## save oof to compute the CV later
-                oof_preds.append(preds)
-                oof_targets.append(y_val)
-                scores.append(score)
-                scores_auc.append(auc_multi(y_val,preds))
-                print(f"validation fold {j} : {score}")
-            oof_preds_all.append(np.concatenate(oof_preds))
-            oof_targets_all.append(np.concatenate(oof_targets))
-            scores_all.append(np.array(scores))
-            scores_auc_all.append(np.array(scores_auc))
-
-        for i in range(cfg.num_ensembling):
-            print("CV score fold : ", log_loss_multi(oof_targets_all[i], oof_preds_all[i]))
-            print("auc mean : ", sum(scores_auc_all[i]) / len(scores_auc_all[i]))
-
-    else:
-        i = 0
-        mskf = MultilabelStratifiedShuffleSplit(n_splits=1000, test_size=0.1, random_state=0)
-        oof_preds = []
-        oof_targets = []
-        scores = []
-        scores_auc = []
-        for j, (train_idx, val_idx) in enumerate(mskf.split(np.zeros(len(cat_tr)), targets_tr)):
-            if i == cfg.SPLITS:
-                break
-            if not check_targets(targets_tr[train_idx]):
-                continue
-            print("FOLDS : ", i, j)
-
-            ## model
-            X_train, y_train = torch.as_tensor(np.concatenate([cat_tr[train_idx], numerical_tr[train_idx] ], axis=1)), torch.as_tensor(targets_tr[train_idx])
-            X_val, y_val = torch.as_tensor(np.concatenate([cat_tr[val_idx], numerical_tr[val_idx] ], axis=1)), torch.as_tensor(targets_tr[val_idx])
-            model = TabNetRegressor(n_d=8, n_a=8, n_steps=3, gamma=1.3, cat_dims=cat_dims, cat_emb_dim=cfg.cat_emb_dim, cat_idxs=cats_idx, optimizer_fn=torch.optim.Adam,
-                               optimizer_params=dict(lr=1e-3, amsgrad=True), mask_type="sparsemax", device_name=cfg.device)
-
-            model.fit(X_train=X_train, y_train=y_train, X_valid=X_val, y_valid=y_val,max_epochs=cfg.EPOCHS, patience=50, batch_size=512, virtual_batch_size=32,
-                    num_workers=0, drop_last=False, loss_fn=torch.nn.functional.binary_cross_entropy_with_logits)
-            model.load_best_model()
-            preds = model.predict(X_val)
-            preds = torch.sigmoid(torch.as_tensor(preds)).detach().cpu().numpy()
-            score = log_loss_multi(y_val, preds)
-            name = cfg.save_name + f"_{j}"
-            model.save_model(name)
-            ## save oof to compute the CV later
-            oof_preds.append(preds)
-            oof_targets.append(y_val)
-            scores.append(score)
-            scores_auc.append(auc_multi(y_val,preds))
-
-            i+=1
-            #break
-
-        print("auc mean : ", sum(scores_auc)/len(scores_auc))
-        print("CV score : ", log_loss_multi(np.concatenate(oof_targets) , np.concatenate(oof_preds)))
-
-def eval():
-    seed_everything(42)
-
-    data_dir = '../../data'
-    train = pd.read_csv(os.path.join(data_dir, 'train_features.csv'))
-    train_targets_scored = pd.read_csv(os.path.join(data_dir, 'train_targets_scored.csv'))
-    train_targets_nonscored = pd.read_csv(os.path.join(data_dir, 'train_targets_nonscored.csv'))
-    test_features = pd.read_csv(os.path.join(data_dir, 'test_features.csv'))
-    submission = pd.read_csv(os.path.join(data_dir, 'sample_submission.csv'))
-
-    remove_vehicle = True
-
-    if remove_vehicle:
-        train_features = train.loc[train['cp_type']=='trt_cp'].reset_index(drop=True)
-        train_targets_scored = train_targets_scored.loc[train['cp_type']=='trt_cp'].reset_index(drop=True)
-        train_targets_nonscored = train_targets_nonscored.loc[train['cp_type']=='trt_cp'].reset_index(drop=True)
-    else:
-        train_features = train
-
-    col_features = list(train_features.columns)[1:]
-    cat_tr, cat_test, numerical_tr, numerical_test = \
-        transform_data(train_features, test_features, col_features,
-                       normalize=False, removed_vehicle=remove_vehicle)
-
-    columns, ratios = get_ratio_labels(train_targets_scored)
-    columns_nonscored, ratios_nonscored = get_ratio_labels(train_targets_nonscored)
-    targets_tr = train_targets_scored[columns].values.astype(np.float32)
-    targets2_tr = train_targets_nonscored[columns_nonscored].values.astype(np.float32)
-
-    cfg = Config(num_class = targets_tr.shape[1], cat_tr = cat_tr, numerical_tr_num=numerical_tr.shape[1])
-    cfg.save_name = './tabnet_batchsize/tabnet_raw_step1'
-
-    X_test = np.concatenate([cat_test, numerical_test], axis=1)
-
-    if cfg.strategy == "KFOLD":
-        oof_preds_all = []
-        oof_targets_all = []
-        scores_all =  []
-        scores_auc_all= []
-        preds_test = []
-        for seed in range(cfg.num_ensembling):
-            print("## SEED : ", seed)
-            mskf = MultilabelStratifiedKFold(n_splits=cfg.SPLITS, random_state=cfg.seed+seed, shuffle=True)
-            oof_preds = []
-            oof_targets = []
-            scores = []
-            scores_auc = []
-            p = []
-            for j, (train_idx, val_idx) in enumerate(mskf.split(np.zeros(len(cat_tr)), targets_tr)):
-                print("FOLDS : ", j)
-
-                ## model
-                X_train, y_train = torch.as_tensor(np.concatenate([cat_tr[train_idx], numerical_tr[train_idx] ], axis=1)), torch.as_tensor(targets_tr[train_idx])
-                X_val, y_val = torch.as_tensor(np.concatenate([cat_tr[val_idx], numerical_tr[val_idx] ], axis=1)), torch.as_tensor(targets_tr[val_idx])
-                model = TabNetRegressor(n_d=32, n_a=32, n_steps=1, gamma=1.3, lambda_sparse=0, cat_dims=cfg.cat_dims, cat_emb_dim=cfg.cat_emb_dim, cat_idxs=cfg.cats_idx, optimizer_fn=torch.optim.Adam,
-                                   optimizer_params=dict(lr=2e-2), mask_type='entmax', device_name=cfg.device, scheduler_params=dict(milestones=[ 50,100,150], gamma=0.9), scheduler_fn=torch.optim.lr_scheduler.MultiStepLR)
-                #'sparsemax'
-            
-                name = cfg.save_name + f"_fold{j}_{seed}"
-                model.load_model_infer(name)
-                # preds on val
-                preds = model.predict(X_val)
-                preds = torch.sigmoid(torch.as_tensor(preds)).detach().cpu().numpy()
-                score = log_loss_multi(y_val, preds)
-            
-                # preds on test
-                temp = model.predict(X_test)
-                p.append(torch.sigmoid(torch.as_tensor(temp)).detach().cpu().numpy())
-                ## save oof to compute the CV later
-                oof_preds.append(preds)
-                oof_targets.append(y_val)
-                scores.append(score)
-                scores_auc.append(auc_multi(y_val,preds))
-                print(f"validation fold {j} : {score}")
-            p = np.stack(p)
-            preds_test.append(p)
-            oof_preds_all.append(np.concatenate(oof_preds))
-            oof_targets_all.append(np.concatenate(oof_targets))
-            scores_all.append(np.array(scores))
-            scores_auc_all.append(np.array(scores_auc))
-        preds_test = np.stack(preds_test)
-
-        for i in range(cfg.num_ensembling): 
-            print("CV score fold : ", log_loss_multi(oof_targets_all[i], oof_preds_all[i]))
-            print("auc mean : ", sum(scores_auc_all[i])/len(scores_auc_all[i]))
-
-    if cfg.strategy != "KFOLD":
-        i = 0
-        mskf = MultilabelStratifiedShuffleSplit(n_splits=1000, test_size=0.1, random_state=0)
-        oof_preds = []
-        oof_targets = []
-        scores = []
-        scores_auc = []
-        for j, (train_idx, val_idx) in enumerate(mskf.split(np.zeros(len(cat_tr)), targets_tr)):
-            if i == cfg.SPLITS:
-                break
-            
-            if not check_targets(targets_tr[train_idx]):
-                continue
-            print("FOLDS : ", i, j)
-
-            ## model
-            X_train, y_train = torch.as_tensor(np.concatenate([cat_tr[train_idx], numerical_tr[train_idx] ], axis=1)), torch.as_tensor(targets_tr[train_idx])
-            X_val, y_val = torch.as_tensor(np.concatenate([cat_tr[val_idx], numerical_tr[val_idx] ], axis=1)), torch.as_tensor(targets_tr[val_idx])
-            model = TabNetRegressor(n_d=8, n_a=8, n_steps=3, gamma=1.3, cat_dims=cat_dims, cat_emb_dim=cfg.cat_emb_dim, cat_idxs=cats_idx, optimizer_fn=torch.optim.Adam,
-                               optimizer_params=dict(lr=1e-3, amsgrad=True), mask_type="sparsemax", device_name=cfg.device)
-        
-            name = cfg.save_name + f"_{j}"
-            model.load_model(name)
-            # preds on val
-            preds = model.predict(X_val)
-            preds = torch.sigmoid(torch.as_tensor(preds)).detach().cpu().numpy()
-            score = log_loss_multi(y_val, preds)
-
-            # preds on test
-            temp = model.predict(X_test)
-            p.append(torch.sigmoid(torch.as_tensor(temp)).detach().cpu().numpy())
-            ## save oof to compute the CV later
-            oof_preds.append(preds)
-            oof_targets.append(y_val)
-            scores.append(score)
-            scores_auc.append(auc_multi(y_val,preds))
-            print(f"validation fold {j} : {score}")
-            i+=1
-            p = np.stack(p)
-            preds_test.append(p)
-
-        preds_test = np.stack(preds_test)
-
-        print("auc mean : ", sum(scores_auc)/len(scores_auc))
-        print("CV score : ", log_loss_multi(np.concatenate(oof_targets) , np.concatenate(oof_preds)))
-
-    # clip the submission
-    sub = np.clip(preds_test.mean(1).mean(0), 0.001, 0.995)
-    submission[columns] = sub
-    submission.loc[test_features['cp_type']=='ctl_vehicle', submission.columns[1:]] = 0
-    submission.to_csv("submission.csv", index=False)
 
 if __name__ == '__main__':
-    train()
+    main()

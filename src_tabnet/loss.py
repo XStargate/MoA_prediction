@@ -1,44 +1,37 @@
 import numpy as np
-from sklearn.metrics import roc_auc_score
 import torch
-from torch import nn
-import torch.nn.functional as F
+import torch.nn as nn
 from torch.nn.modules.loss import _WeightedLoss
+import torch.nn.functional as F
+from pytorch_tabnet.metrics import Metric
 
 
-from pdb import set_trace
+class SmoothBCEwLogits(_WeightedLoss):
+    def __init__(self, weight=None, reduction='mean', smoothing=0.0):
+        super().__init__(weight=weight, reduction=reduction)
+        self.smoothing = smoothing
+        self.weight = weight
+        self.reduction = reduction
 
-def log_loss_score(actual, predicted,  eps=1e-15):
+    @staticmethod
+    def _smooth(targets: torch.Tensor, n_labels: int, smoothing=0.0):
+        assert 0 <= smoothing < 1
+        with torch.no_grad():
+            targets = targets * (1.0 - smoothing) + smoothing/n_labels
+        return targets
 
-    """
-    :param predicted:   The predicted probabilities as floats between 0-1
-    :param actual:      The binary labels. Either 0 or 1.
-    :param eps:         Log(0) is equal to infinity, so we need to offset our predicted values slightly by eps from 0 or 1
-    :return:            The logarithmic loss between between the predicted probability assigned to the possible outcomes for item i, and the actual outcome.
-    """
+    def forward(self, inputs, targets):
+        targets = SmoothBCEwLogits._smooth(targets, inputs.size(-1),
+                                           self.smoothing)
+        loss = F.binary_cross_entropy_with_logits(inputs, targets, self.weight)
 
-    p1 = actual * np.log(predicted+eps)
-    p0 = (1-actual) * np.log(1-predicted+eps)
-    loss = p0 + p1
+        if self.reduction == 'sum':
+            loss = loss.sum()
+        elif self.reduction == 'mean':
+            loss = loss.mean()
 
-    return -loss.mean()
+        return loss
 
-def log_loss_multi(y_true, y_pred):
-    M = y_true.shape[1]
-    results = np.zeros(M)
-    for i in range(M):
-        results[i] = log_loss_score(y_true[:,i], y_pred[:,i])
-    return results.mean()
-
-def auc_multi(y_true, y_pred):
-    M = y_true.shape[1]
-    results = np.zeros(M)
-    for i in range(M):
-        try:
-            results[i] = roc_auc_score(y_true[:,i], y_pred[:,i])
-        except:
-            pass
-    return results.mean()
 
 class LabelSmoothingLoss(nn.Module):
     def __init__(self, classes, smoothing=0.0, dim=-1):
@@ -54,48 +47,64 @@ class LabelSmoothingLoss(nn.Module):
             # true_dist = pred.data.clone()
             true_dist = torch.zeros_like(pred)
             true_dist.fill_(self.smoothing / (self.cls - 1))
-            # true_dist.scatter_(1, target.data.unsqueeze(1).type(torch.int64), self.confidence)
-            true_dist[target.type(torch.int64) == 1] = self.confidence
+            true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
         return torch.mean(torch.sum(-true_dist * pred, dim=self.dim))
 
-# def log_loss_multi_smooth(target, pred, smooth=0.001, dim=-1):
-#     cls = target.shape[1]
-#     pred = pred.log_softmax(dim=dim)
-#     with torch.no_grad():
-#         true_dist = torch.zeros_like(pred)
-#         true_dist.fill_(smooth / (cls - 1))
-#         true_dist.scatter_(1, target.data.unsqueeze(1), 1.0-smooth)
-#     return torch.mean(torch.sum(-true_dist * pred, dim=dim))
 
-class SmoothBCEwLogits(_WeightedLoss):
-    def __init__(self, weight=None, reduction='mean', smoothing=0.0):
-        super().__init__(weight=weight, reduction=reduction)
-        self.smoothing = smoothing
-        self.weight = weight
+class LogitsLogLoss(Metric):
+    """
+    LogLoss with sigmoid applied
+    """
+
+    def __init__(self):
+        self._name = "logits_ll"
+        self._maximize = False
+
+    def __call__(self, y_true, y_pred):
+        """
+        Compute LogLoss of predictions.
+
+        Parameters
+        ----------
+        y_true: np.ndarray
+            Target matrix or vector
+        y_score: np.ndarray
+            Score matrix or vector
+
+        Returns
+        -------
+            float
+            LogLoss of predictions vs targets.
+        """
+        logits = 1 / (1 + np.exp(-y_pred))
+        aux = (1 - y_true) * np.log(1 - logits + 1e-15) + y_true * np.log(logits + 1e-15)
+        return np.mean(-aux)
+
+
+def Logloss(y_true, y_pred):
+
+    aux = (1 - y_true) * np.log(1 - y_pred + 1e-15) + y_true * np.log(y_pred + 1e-15)
+    return np.mean(-aux)
+
+
+class BCEwLogitsSmooth(nn.Module):
+    def __init__(self, smooth=0.0, dim=-1, reduction='mean'):
+        super().__init__()
+        self.confidence = 1.0 - smooth
+        self.smooth = smooth
         self.reduction = reduction
-
-    @staticmethod
-    def _smooth(targets:torch.Tensor, n_labels:int, smoothing=0.0):
-        assert 0 <= smoothing < 1
-        with torch.no_grad():
-            targets = targets * (1.0 - smoothing) + 0.5 * smoothing
-        return targets
+        self.dim = dim
 
     def forward(self, inputs, targets):
-        targets = SmoothBCEwLogits._smooth(targets, inputs.size(-1),
-            self.smoothing)
-        loss = F.binary_cross_entropy_with_logits(inputs, targets,self.weight)
+        with torch.no_grad():
+            # true_dist = pred.data.clone()
+            true_dist = torch.zeros_like(targets)
+            true_dist = targets * self.confidence + 0.5 * self.smooth
 
-        if  self.reduction == 'sum':
+        loss = F.binary_cross_entropy_with_logits(inputs, true_dist)
+        if self.reduction == 'sum':
             loss = loss.sum()
-        elif  self.reduction == 'mean':
+        elif self.reduction == 'mean':
             loss = loss.mean()
 
         return loss
-
-
-if __name__ == '__main__':
-    loss = LabelSmoothingLoss(classes=3, smoothing=0.01)
-    pred = torch.tensor([[2.,2.,2.], [2.,2.,2.], [2.,2.,2.], [2.,2.,2.], [2.,2.,2.]])
-    target = torch.tensor([[0, 1, 0], [1, 0, 0], [0, 0, 1], [0, 0, 0], [1, 1, 1]])
-    loss.forward(pred, target)
