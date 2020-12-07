@@ -12,10 +12,13 @@ class Config(object):
         self.batch_size = 128
         self.learning_rate = 1e-3
         self.weight_decay = 1e-5
-        self.nfolds = 5
+        self.nfolds = 7
         self.early_stopping_steps = 10
         self.early_stop = False
         self.hidden_size = 1500
 
-        self.seed = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        self.seeds = [42, 44, 88, 38, 27, 90, 98, 18, 68, 86]
         self.loss_smooth = 0.001
+        
+        self.ncomp_g = 463
+        self.ncomp_c = 60

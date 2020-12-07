@@ -1,13 +1,6 @@
 from sklearn.preprocessing import QuantileTransformer
 
-def rankGauss(train_features, test_features, runty, test_features_p = None):
-    
-    if (runty == 'traineval'):
-        assert test_features_p is None,  \
-            "Error: test_features_private should be None when run type is 'traineval'"
-    elif (runty == 'eval'):
-        assert test_features_p is not None,  \
-            "Error: test_features_private should not be None when run type is 'eval'"
+def rankGauss(train_features, test_features):
 
     GENES = [col for col in train_features.columns if col.startswith('g-')]
     CELLS = [col for col in train_features.columns if col.startswith('c-')]
@@ -24,10 +17,5 @@ def rankGauss(train_features, test_features, runty, test_features_p = None):
         train_features[col] = transformer.transform(raw_vec).reshape(1, vec_len)[0]
         test_features[col] =  transformer.transform(
             test_features[col].values.reshape(vec_len_test, 1)).reshape(1, vec_len_test)[0]
-        
-        if (runty == 'eval'):
-            vec_len_test_p = len(test_features_p[col].values)
-            test_features_p[col] = transformer.transform(
-                test_features_p[col].values.reshape(vec_len_test_p, 1)).reshape(1, vec_len_test_p)[0]
 
-    return train_features, test_features, test_features_p
+    return train_features, test_features
