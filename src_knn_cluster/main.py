@@ -54,7 +54,6 @@ def main():
     train_features, test_features, test_features_private =   \
         _pca_select(train_features, test_features, test_features_private)
     
-    set_trace()    
     train_features, test_features, test_features_private =   \
         fe_cluster_all(train_features=train_features, test_features=test_features,
                        test_features_private=test_features_private,
@@ -62,17 +61,15 @@ def main():
                        test_features_private2=test_features_private2,
                        train_pca=train_pca, test_pca=test_pca, test_pca_p=test_pca_p)
         
-    set_trace()
     if (runty == 'traineval'):
         train, test, target = process(train_features, test_features, train_targets_scored)
     elif (runty == 'eval'):
         train, test, target = process(train_features, test_features_private, train_targets_scored)
-    set_trace()
+
     folds = train.copy()
 
     target_cols = target.drop('sig_id', axis=1).columns.values.tolist()
 
-    set_trace()
     oof = np.zeros((len(train), len(target_cols)))
     predictions = np.zeros((len(test), len(target_cols)))
 
