@@ -11,4 +11,4 @@ src_knn_cluster: FCNN(MLP) network based on PCA and Rankgauss.
 src_tabnet: Tabnet network based on PCA and Rankgauss.  
 
 The final result is from a blend model:  
-0.33*src_resnet_tensorflow + 0.33*src_transfer_drugid_new + 0.2*src_knn_cluster + 0.095*src_rankgauss_new + 0.045*src_tabnet
+0.33 * src_resnet_tensorflow + 0.33 * src_transfer_drugid_new + 0.2 * src_knn_cluster + 0.095 * src_rankgauss_new + 0.045 * src_tabnet
